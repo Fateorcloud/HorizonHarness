@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
-    { name = "Fateorcloud", email = "121081603+Fateorcloud@users.noreply.github.com" },
+    { name = "Fateorcloud", email = "zpb7717969@gmail.com" },
 ]
 keywords = ["agent", "llm", "long-horizon", "runtime", "harness", "evaluation"]
 classifiers = [
