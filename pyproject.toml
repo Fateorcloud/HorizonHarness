@@ -1,0 +1,86 @@
+[project]
+name = "horizon-harness"
+version = "0.1.0"
+description = "A long-horizon agent runtime and evaluation harness."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "yesiyu.andy", email = "andyyesiyu@gmail.com" },
+]
+keywords = ["agent", "llm", "long-horizon", "runtime", "harness", "evaluation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "anthropic>=0.39.0",
+    "filelock>=3.13.0",
+    "openai>=1.50.0",
+]
+
+[project.optional-dependencies]
+swebench = [
+    "datasets>=2.0.0",
+    "docker>=7.0.0",
+    "swebench>=3.0.0",
+    # The official SWE-bench Pro evaluator (scaleapi/SWE-bench_Pro-os) imports
+    # pandas; bundling it here keeps `--pro --run-official` a single command.
+    "pandas>=1.5.0",
+]
+programbench = [
+    # docker-py drives LocalDockerBackend; programbench is the official scorer
+    # (and the bundled task set) used by evals/programbench/evaluate_submissions.py.
+    "docker>=7.0.0",
+    "programbench>=1.0.0",
+]
+mcp = [
+    # 1.10.0 is the first release with ResourceLink, AudioContent, and
+    # CallToolResult.structuredContent, all of which the integration uses.
+    "mcp>=1.10.0",
+]
+harbor = [
+    # Harbor's local Docker execution path imports docker-py directly during
+    # setup; keep the SDK in the same extra as the benchmark runner.
+    "docker>=7.0.0",
+    "harbor>=0.17.1; python_version >= '3.12'",
+]
+memory = [
+    "sentence-transformers>=5.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Fateorcloud/horizon-harness"
+Repository = "https://github.com/Fateorcloud/horizon-harness"
+Issues = "https://github.com/Fateorcloud/horizon-harness/issues"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.12",
+    "ty>=0.0.1a26",
+]
+
+[tool.uv]
+managed = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/horizon_harness"]
+# The bundled skill library (src/horizon_harness/skills/library) ships as
+# package data: hatchling includes the non-Python files (README.md and any
+# SKILL.md/scripts added later) because they live inside the package tree.
+artifacts = ["src/horizon_harness/skills/library/**"]

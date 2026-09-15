@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: tests / py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      # The trace-viewer contract test (tests/unit/test_trace_viewer_contract.py)
+      # shells out to `node`; pin it so the suite actually runs instead of
+      # skipping on the runner's incidental node.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Sync dev dependencies
+        run: uv sync --group dev --extra mcp
+      - name: Run unit tests
+        run: uv run python -m unittest discover -s tests/unit
+      - name: Run example smoke
+        run: bash runs/demos/run_bash_agent_demo.sh
+
+  type-check:
+    name: ty / src
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync dev dependencies
+        run: uv sync --group dev --extra mcp
+      - name: Run ty check
+        run: uv run ty check src
+
+  docs-lint:
+    name: docs lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync dev dependencies
+        run: uv sync --group dev
+      - name: Run docs lint
+        run: uv run python -m scripts.lint_docs
+      - name: Check config reference is up to date
+        run: uv run python -m scripts.build_config_reference --check
+
+  arch-lint:
+    name: architecture lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync dev dependencies
+        run: uv sync --group dev
+      - name: Run architecture lint
+        run: uv run python -m scripts.arch_lint
+      - name: Run env-registry lint
+        run: uv run python -m scripts.env_lint
+
+  format:
+    name: ruff format / check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync dev dependencies
+        run: uv sync --group dev
+      - name: Check formatting
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .

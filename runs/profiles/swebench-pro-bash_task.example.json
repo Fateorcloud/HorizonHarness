@@ -1,0 +1,16 @@
+{
+  "_comment": "HorizonHarness single bash/read/task agent on SWE-bench Pro. Use `HORIZON_CAPABILITIES=bash,read,task HORIZON_WORKFLOW=single bash runs/swebench/run_swebench.sh --variant pro <instance-id>`. Provider creds stay in .env (do NOT put OPENAI_AUTH_TOKEN in a committed profile).",
+  "env": {
+    "_comment": "Catalogued env knobs forwarded into the swebench container (see docs/configuration.md). Applied fill-the-gaps: a real export still wins. Agent capabilities and workflow are explicit environment axes.",
+    "HORIZON_CAPABILITIES": "bash,read,task",
+    "HORIZON_WORKFLOW": "single",
+    "HORIZON_REASONING_EFFORT": "high"
+  },
+  "run": {
+    "_comment": "swebench long options (run_bench.py swebench; without --). Defaults; an explicit CLI flag overrides. `dataset-name` selects SWE-bench Pro mode; the env section selects the single bash/read/task solver.",
+    "dataset-name": "ScaleAI/SWE-bench_Pro",
+    "max-turns": 200,
+    "network-mode": "host",
+    "prepare-wheelhouse": true
+  }
+}

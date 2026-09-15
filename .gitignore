@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+# Live model-config file (may hold an inline auth_token); commit models.example.json only.
+models.json
+*.local.json
+# Run-profiles may reference local paths/creds; commit only *.example.json.
+runs/profiles/*.json
+!runs/profiles/*.example.json
+# Multi-bench manifests for `run_bench.py all`; commit only the example.
+runs/bench-manifest*.json
+!runs/bench-manifest.example.json
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# Local eval artifacts — keep only the README documenting the layout.
+evals/out/*
+!evals/out/README.md
+logs/
+.tmp/
+
+# Local reference-architecture research notes — kept off the public repo.
+# Drop your own `<system-name>.md` notes under docs/reference-architectures/;
+# the dir's contents are gitignored except for README.md and template.md.
+docs/reference-architectures/*
+!docs/reference-architectures/README.md
+!docs/reference-architectures/template.md
+
+# Superpowers process artifacts (implementation plans, brainstorms) — local
+# scratch only. Durable guidance belongs in the narrowest agent-native topic doc.
+docs/superpowers/
+
+# Vendored OneMillion-Bench checkout — a separate upstream project kept locally
+# as a reference for the `onemillion` eval suite (its grading logic is ported
+# into the wheel under horizon_harness.evals.suites.onemillion). Never pushed:
+# it has its own git repo, license, dataset, and a large tech_report.pdf.
+/OneMillion-Bench/
+
+# Downloaded benchmark datasets (HuggingFace, etc.), any derived test sets, and
+# the local-only build scripts that generate them — large, licensed upstream
+# content, never committed (e.g. datasets/build_onemillion_testset.py).
+datasets/
+
+# Local-only testing notes for the OneMillion-Bench suite (kept off the repo).
+evals/onemillion/TESTING.md
+
+# Node
+node_modules/
+
+# Impeccable critique artifacts — local only
+.impeccable/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/

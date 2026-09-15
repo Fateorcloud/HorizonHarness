@@ -1,0 +1,11 @@
+{
+  "name": "trace-viewer",
+  "private": true,
+  "version": "1.0.0",
+  "description": "A single-file HTML viewer for horizon-harness.trajectory.v1 trace records.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "Apache-2.0",
+  "type": "commonjs"
+}

@@ -1,0 +1,289 @@
+"""Typed runtime events shared across the agent loop and tool dispatch.
+
+Every event is a frozen, keyword-only dataclass with explicitly named
+fields. Each one carries a stable `kind: EventKind` discriminator stored
+as a real `Literal[...]` field with `init=False`, so callers can pattern
+match with `isinstance` (preferred) or filter on `event.kind`, and so
+`dataclasses.asdict` (and any JSON path that goes through it) keeps the
+discriminator intact. Construction omits `index` and `elapsed` (they
+default to placeholder values); `State.record_event` stamps the real
+values when the event is appended.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+
+from .messages import AgentName, Message, MessageKind, TokenUsage
+
+if TYPE_CHECKING:
+    from .tools import ToolResult
+
+
+class EventKind(str, Enum):
+    MESSAGE = "message"
+    AGENT_START = "agent_start"
+    AGENT_END = "agent_end"
+    TURN_START = "turn_start"
+    TURN_END = "turn_end"
+    MODEL_REQUEST = "model_request"
+    MODEL_RESPONSE = "model_response"
+    CONTEXT_COMPRESSION = "context_compression"
+    TOOL_EXECUTION_START = "tool_execution_start"
+    TOOL_EXECUTION_UPDATE = "tool_execution_update"
+    TOOL_EXECUTION_END = "tool_execution_end"
+    HOOK_FIRED = "hook_fired"
+    GOAL_STATUS = "goal_status"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, kw_only=True)
+class _BaseEvent:
+    # Placeholders; `State.record_event` stamps the real values on append.
+    # `uuid` is a stable, globally-unique id for this event — independent of its
+    # positional `index`, so the append-only stream survives merges/resumes and
+    # an event can be referenced across files (cf. Claude Code's transcript).
+    index: int = -1
+    elapsed: float = 0.0
+    uuid: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class MessageEvent(_BaseEvent):
+    kind: Literal[EventKind.MESSAGE] = field(default=EventKind.MESSAGE, init=False)
+    message: Message
+
+
+@dataclass(frozen=True, kw_only=True)
+class AgentStartEvent(_BaseEvent):
+    kind: Literal[EventKind.AGENT_START] = field(
+        default=EventKind.AGENT_START, init=False
+    )
+    # The agent that started and its (constant, per-agent) system prompt. The
+    # prompt is the one request field not otherwise in the event stream, so it
+    # rides here for readers to build the schema-v5 `agents` registry.
+    # Both default-empty so legacy `AgentStartEvent()` construction still works.
+    agent: AgentName = ""
+    system_prompt: str = ""
+
+
+# Why an agent's run loop stopped. Closed set so static checkers catch
+# typos and consumers can match exhaustively (same rationale as
+# `MessageKind` / `StopReason`); the loop in `core.run` is the sole
+# producer.
+#   "done"           — the agent emitted a `kind="final"` message
+#   "max_turns"      — the turn budget ran out before a final message
+#   "tool_terminate" — a tool returned `ToolResult(terminate=True)`
+#   "abort"          — the caller's abort flag fired (e.g. wall-time limit)
+AgentEndReason: TypeAlias = Literal["done", "max_turns", "tool_terminate", "abort"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class AgentEndEvent(_BaseEvent):
+    kind: Literal[EventKind.AGENT_END] = field(default=EventKind.AGENT_END, init=False)
+    reason: AgentEndReason
+
+
+@dataclass(frozen=True, kw_only=True)
+class TurnStartEvent(_BaseEvent):
+    kind: Literal[EventKind.TURN_START] = field(
+        default=EventKind.TURN_START, init=False
+    )
+    agent: AgentName
+
+
+@dataclass(frozen=True, kw_only=True)
+class TurnEndEvent(_BaseEvent):
+    kind: Literal[EventKind.TURN_END] = field(default=EventKind.TURN_END, init=False)
+    agent: AgentName
+    terminated: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class ModelRequestEvent(_BaseEvent):
+    kind: Literal[EventKind.MODEL_REQUEST] = field(
+        default=EventKind.MODEL_REQUEST, init=False
+    )
+    agent: AgentName
+    visible_count: int
+    llm_message_count: int
+    # JSON-shaped trace records. Callers read by known keys; `Any` is
+    # deliberate — these dicts are heterogeneous trace data, not typed
+    # records, and static narrowing on every read would just be noise.
+    context_view: dict[str, Any]
+    tools: list[dict[str, Any]]
+    llm_payload: list[Any]
+    # The agent's system prompt, set only when this call's agent does NOT go
+    # through `run()` (so no `agent_start` carries it) — currently the context
+    # compressor. Lets `collect_agents` register it; empty for normal agents,
+    # whose prompt rides on `agent_start`. Kept out of the serialized record's
+    # bulk because it is constant per agent, recorded once where it's known.
+    system_prompt: str = ""
+    # Provider wire-adapter that served this call: ``"fake"`` for the
+    # deterministic test adapter, e.g. ``"openai-chat"`` for a real one. A fake
+    # call is still a model call, so it is recorded and *tagged* here rather
+    # than dropped — derived spans / training turns carry `api` so a downstream
+    # consumer can filter fake data out instead of the runtime hiding it.
+    api: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class ModelResponseEvent(_BaseEvent):
+    kind: Literal[EventKind.MODEL_RESPONSE] = field(
+        default=EventKind.MODEL_RESPONSE, init=False
+    )
+    agent: AgentName
+    output_kind: MessageKind
+    target: AgentName
+    tool_call_count: int
+    # Per-call cost primitives, snapshotted from the response message
+    # alongside the facts above. `usage` is None when the provider didn't
+    # report counts; `model` is "" when unknown. Carrying them here lets the
+    # span layer fold cost without walking messages or the raw blob.
+    usage: TokenUsage | None = None
+    model: str = ""
+    # Provider wire-adapter that served this call (see ModelRequestEvent.api);
+    # ``"fake"`` marks the deterministic test adapter.
+    api: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class ContextCompressionEvent(_BaseEvent):
+    """One compaction pass — an N->1 fold or a 1->1 in-place rewrite.
+
+    `active_context_indices` is the new active context (preserved messages +
+    summary + recent), in chronological order. `compressed_message_indices`
+    lists the messages that were folded into `summary_message_index`. The
+    trace viewer can derive "preserved" / "recent" from the order of
+    `active_context_indices` relative to `summary_message_index`.
+
+    A `rewrite=True` decision records the same event: `compressed_message_indices`
+    is the single rewritten index and `summary_message_index` is its in-place
+    replacement (which keeps the target's `kind`, e.g. `"tool_result"`, rather
+    than `"summary"`).
+
+    `strategy` names the mechanism that produced the fold (the firing strategy's
+    `CompressionDecision.label`, e.g. ``"tool-compact"`` / ``"summarize"`` /
+    ``"agent-compact"``), so a fold is attributable without sniffing the summary
+    text — including which `TieredStrategy` stage fired. Empty when the strategy
+    set no label.
+
+    `start_elapsed` is the run-relative time when compression work began. The
+    event's inherited `elapsed` remains the completion time, so compression
+    spans can show real duration even when a strategy performs nested model
+    calls before the summary event is appended.
+    """
+
+    kind: Literal[EventKind.CONTEXT_COMPRESSION] = field(
+        default=EventKind.CONTEXT_COMPRESSION, init=False
+    )
+    agent: AgentName
+    summary_message_index: int
+    compressed_message_indices: list[int]
+    active_context_indices: list[int]
+    before_tokens: int
+    after_tokens: int
+    strategy: str = ""
+    start_elapsed: float | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ToolExecutionStartEvent(_BaseEvent):
+    kind: Literal[EventKind.TOOL_EXECUTION_START] = field(
+        default=EventKind.TOOL_EXECUTION_START, init=False
+    )
+    tool_call_id: str
+    tool_name: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class ToolExecutionUpdateEvent(_BaseEvent):
+    kind: Literal[EventKind.TOOL_EXECUTION_UPDATE] = field(
+        default=EventKind.TOOL_EXECUTION_UPDATE, init=False
+    )
+    tool_call_id: str
+    tool_name: str
+    partial: ToolResult
+
+
+@dataclass(frozen=True, kw_only=True)
+class ToolExecutionEndEvent(_BaseEvent):
+    kind: Literal[EventKind.TOOL_EXECUTION_END] = field(
+        default=EventKind.TOOL_EXECUTION_END, init=False
+    )
+    tool_call_id: str
+    tool_name: str
+    is_error: bool
+    terminate: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class HookFiredEvent(_BaseEvent):
+    """One firing of a lifecycle hook point — observe-only trace of an
+    otherwise invisible control-flow decision.
+
+    Hooks (see `hooks.py`) are append-only — they can block a tool call or add
+    messages; the decision flows back through a `HookDecision`, and this event
+    records that the point fired and how it resolved so the trace shows hook
+    activity. `point` is the `HookPoint` value; `target` is the tool/sub-agent
+    name in scope (or ""). A non-empty `block_reason` means the point blocked;
+    `emitted` is how many messages the hooks added.
+    """
+
+    kind: Literal[EventKind.HOOK_FIRED] = field(
+        default=EventKind.HOOK_FIRED, init=False
+    )
+    point: str
+    agent: AgentName
+    target: str = ""
+    block_reason: str = ""
+    emitted: int = 0
+
+
+# The goal loop's lifecycle status. Superset of GoalResult's terminal
+# `GoalStatus`: "active" marks a turn where the loop is still continuing.
+GoalLifecycleStatus: TypeAlias = Literal[
+    "active", "complete", "blocked", "budget_exhausted", "aborted"
+]
+
+
+@dataclass(frozen=True, kw_only=True)
+class GoalStatusEvent(_BaseEvent):
+    """One goal-loop turn's outcome — an append-only, replay-able record of the
+    goal's lifecycle.
+
+    Recorded by `run_goal_loop` (not the inner ReAct loop). `StateSnapshot.apply`
+    ignores it, so it lives only in `state.events` (trace/audit/replay) and never
+    enters the model context. The objective is carried so a goal is fully
+    reconstructable from the log alone.
+    """
+
+    kind: Literal[EventKind.GOAL_STATUS] = field(
+        default=EventKind.GOAL_STATUS, init=False
+    )
+    objective: str
+    status: GoalLifecycleStatus
+    turns_used: int
+    tokens_used: int = 0
+    reason: str = ""
+
+
+Event: TypeAlias = (
+    MessageEvent
+    | AgentStartEvent
+    | AgentEndEvent
+    | TurnStartEvent
+    | TurnEndEvent
+    | ModelRequestEvent
+    | ModelResponseEvent
+    | ContextCompressionEvent
+    | ToolExecutionStartEvent
+    | ToolExecutionUpdateEvent
+    | ToolExecutionEndEvent
+    | HookFiredEvent
+    | GoalStatusEvent
+)
