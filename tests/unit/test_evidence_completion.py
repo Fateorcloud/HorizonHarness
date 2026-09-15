@@ -2,8 +2,6 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest import mock
-import subprocess
 
 from horizon_harness.workspace.verification import (
     AcceptanceContract,
@@ -36,6 +34,28 @@ class EvidenceCompletionTests(unittest.TestCase):
                     next_action="changed after verification",
                 )
             )
+
+            with self.assertRaisesRegex(UnsafeCheckpointError, "stale"):
+                session.complete_if_verified(task.task_id, contract)
+
+    def test_completed_task_still_rejects_stale_code_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "code"
+            root.mkdir()
+            checked = root / "checked.txt"
+            checked.write_text("accepted", encoding="utf-8")
+            contract = AcceptanceContract(
+                "frozen", ('test "$(cat checked.txt)" = accepted',)
+            )
+            session = TaskSession(
+                FAKE_PROVIDER, code_dir=root, store_dir=Path(tmp) / "store"
+            )
+            task = session.start(
+                "verify", acceptance_contract=contract, pause_after_turns=1
+            )
+            session.verify(task.task_id, contract)
+            session.complete_if_verified(task.task_id, contract)
+            checked.write_text("changed", encoding="utf-8")
 
             with self.assertRaisesRegex(UnsafeCheckpointError, "stale"):
                 session.complete_if_verified(task.task_id, contract)
@@ -168,18 +188,32 @@ class EvidenceCompletionTests(unittest.TestCase):
                 )
             )
 
-    def test_verifier_failures_have_distinct_outcomes(self):
-        contract = AcceptanceContract("contract-v1", ("true",))
+    def test_real_verifier_process_failures_have_distinct_outcomes(self):
         cases = (
-            (subprocess.TimeoutExpired("true", 1), "budget_stopped"),
-            (OSError("spawn failed"), "infrastructure_failed"),
-            (RuntimeError("verifier bug"), "verifier_failed"),
+            (
+                AcceptanceContract(
+                    "missing-command", ("horizon_harness_missing_verifier",)
+                ),
+                None,
+                "infrastructure_failed",
+            ),
+            (
+                AcceptanceContract("crashed-verifier", ("kill -TERM $$",)),
+                None,
+                "verifier_failed",
+            ),
+            (
+                AcceptanceContract("budget", ("sleep 1",)),
+                0.01,
+                "budget_stopped",
+            ),
         )
-        for error, expected in cases:
+        for contract, timeout_seconds, expected in cases:
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
-                with mock.patch(
-                    "horizon_harness.workspace.verification.subprocess.run",
-                    side_effect=error,
-                ):
+                if timeout_seconds is None:
                     receipt = run_verifier("task", tmp, contract)
+                else:
+                    receipt = run_verifier(
+                        "task", tmp, contract, timeout_seconds=timeout_seconds
+                    )
                 self.assertEqual(receipt.outcome, expected)

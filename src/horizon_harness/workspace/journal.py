@@ -12,7 +12,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator, cast
+from typing import Any, Iterable, Iterator
 from horizon_harness.messages import AssistantMessage, tool_results_of
 from .codec import encode_message, decode_message
 
@@ -304,12 +304,14 @@ class ExecutionJournal:
         encoded = json.loads(row[2])
         if isinstance(encoded, list):
             encoded = {"calls": encoded, "assistant_message": None}
+        if not isinstance(encoded, dict):
+            raise ValueError(f"invalid tool batch plan: {batch_id}")
         raw_calls = encoded.get("calls")
-        calls = (
-            [item for item in cast(list[Any], raw_calls) if isinstance(item, dict)]
-            if isinstance(raw_calls, list)
-            else []
-        )
+        if not isinstance(raw_calls, list) or not all(
+            isinstance(item, dict) for item in raw_calls
+        ):
+            raise ValueError(f"invalid tool batch plan: {batch_id}")
+        calls = raw_calls
         return {
             "batch_id": row[0],
             "turn_no": row[1],
@@ -512,6 +514,72 @@ class ExecutionJournal:
                 (batch_id,),
             ).fetchall()
         return tuple(json.loads(row[0]) for row in rows)
+
+    def materialize_terminal_batch_results(self, batch_id: str) -> None:
+        """Project settled execution-step facts into the ordered batch results."""
+        batch = self.batch(batch_id)
+        if batch is None:
+            raise KeyError(batch_id)
+        existing_ids = {row.get("call_id") for row in self.batch_results(batch_id)}
+        for call_index, call in enumerate(batch["calls"]):
+            call_id = call.get("id")
+            if call_id in existing_ids:
+                continue
+            step_id = call.get("execution_step_id")
+            step = self.step(step_id) if isinstance(step_id, str) else None
+            payload = step.get("result_payload") if step else None
+            stored = payload.get("tool_result") if isinstance(payload, dict) else None
+            if (
+                step
+                and step.get("state") in ("succeeded", "failed")
+                and isinstance(stored, dict)
+            ):
+                from .codec import decode_tool_result
+
+                result = decode_tool_result(stored)
+                self.record_batch_result(
+                    batch_id,
+                    call_index,
+                    {
+                        "call_id": call_id,
+                        "is_error": result.is_error,
+                        "terminate": result.terminate,
+                        "details": result.details,
+                        "tool_result": stored,
+                    },
+                )
+                existing_ids.add(call_id)
+
+    def decoded_batch_results(self, batch_id: str):
+        """Return committed results keyed by provider call id in plan order."""
+        from .codec import decode_tool_result
+
+        decoded = []
+        for row in self.batch_results(batch_id):
+            call_id = row.get("call_id")
+            stored = row.get("tool_result")
+            if not isinstance(call_id, str) or not isinstance(stored, dict):
+                raise ValueError(f"invalid durable tool result in batch {batch_id}")
+            decoded.append((call_id, decode_tool_result(stored)))
+        return tuple(decoded)
+
+    def turn_has_terminating_batch(self, turn_no: int) -> bool:
+        """Read the terminal flag needed to finish a sealed crash boundary."""
+        with self._connect() as db:
+            batch_ids = tuple(
+                row[0]
+                for row in db.execute(
+                    "SELECT batch_id FROM tool_batches WHERE turn_no=? ORDER BY rowid",
+                    (turn_no,),
+                ).fetchall()
+            )
+        if len(batch_ids) > 1:
+            raise ValueError(f"turn {turn_no} has multiple durable tool batches")
+        if not batch_ids:
+            return False
+        return any(
+            result.terminate for _, result in self.decoded_batch_results(batch_ids[0])
+        )
 
     def record_batch_tool_result(
         self, batch_id: str, call_index: int, call_id: str, result: Any

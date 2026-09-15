@@ -38,9 +38,54 @@ from runs.workspace_memory_eval import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SELECTION = (
-    ROOT / "evals/out/task-workspace-memory-delivery/swebench/task-selection.json"
-)
+
+
+def _write_plan_fixture(root: Path) -> Path:
+    base = root / "swebench"
+    tasks = base / "tasks"
+    verifier = base / "verifier"
+    tasks.mkdir(parents=True)
+    verifier.mkdir()
+    instances = []
+    for role, instance_id in (
+        ("D", "pytest-dev__pytest-11143"),
+        ("H1", "pytest-dev__pytest-9359"),
+        ("H2", "pytest-dev__pytest-5495"),
+        ("H3", "pytest-dev__pytest-7168"),
+    ):
+        task_name = f"{role}.json"
+        verifier_name = f"{role}.jsonl"
+        (tasks / task_name).write_text(
+            json.dumps({"instance_id": instance_id, "problem_statement": "fix"}),
+            encoding="utf-8",
+        )
+        (verifier / verifier_name).write_text(
+            json.dumps({"instance_id": instance_id}) + "\n",
+            encoding="utf-8",
+        )
+        instances.append(
+            {
+                "role": role,
+                "instance_id": instance_id,
+                "base_commit": f"base-{role}",
+                "agent_task_file": f"tasks/{task_name}",
+                "verifier_row_file": f"verifier/{verifier_name}",
+                "instance_image_key": f"image-{role}",
+            }
+        )
+    selection = base / "task-selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "dataset": "fixture/dataset",
+                "split": "test",
+                "dataset_revision": "fixture-revision",
+                "instances": instances,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return selection
 
 
 class FormalWorkspaceMemoryPlanTests(unittest.TestCase):
@@ -88,7 +133,9 @@ class FormalWorkspaceMemoryPlanTests(unittest.TestCase):
 
     def test_plan_freezes_exact_matrix_and_keeps_oracle_separate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            plan = build_plan(SELECTION, Path(tmp), implementation=ROOT)
+            root = Path(tmp)
+            selection = _write_plan_fixture(root / "input")
+            plan = build_plan(selection, root / "output", implementation=ROOT)
 
             self.assertEqual(
                 [row["cell"] for row in plan["suffix_order"]],
@@ -161,18 +208,25 @@ class FormalWorkspaceMemoryPlanTests(unittest.TestCase):
             self.assertEqual(called, [])
 
     def test_official_report_resolved_id_is_a_pass(self) -> None:
-        report = (
-            ROOT / "evals/out/task-workspace-memory-delivery/swebench/"
-            "verifier-smoke-D/verifier/"
-            "horizon-workspace-memory.verifier-smoke-D.json"
-        )
-        self.assertEqual(
-            _verifier_verdict("pytest-dev__pytest-11143", [report], 0), "pass"
-        )
-        self.assertEqual(
-            _verifier_verdict("pytest-dev__pytest-missing", [report], 0),
-            "infra_error",
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "official-report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "resolved_ids": ["pytest-dev__pytest-11143"],
+                        "error_ids": [],
+                        "empty_patch_ids": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _verifier_verdict("pytest-dev__pytest-11143", [report], 0), "pass"
+            )
+            self.assertEqual(
+                _verifier_verdict("pytest-dev__pytest-missing", [report], 0),
+                "infra_error",
+            )
 
     def test_verifier_timeout_is_recorded_without_aborting(self) -> None:
         task = FrozenTask(

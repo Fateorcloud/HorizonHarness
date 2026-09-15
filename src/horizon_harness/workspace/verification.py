@@ -48,12 +48,15 @@ def run_verifier(
     *,
     verifier_version: str = "local-v1",
     task_revision: int = 0,
+    timeout_seconds: float = 300,
 ) -> VerificationReceipt:
     base = Path(root).expanduser().resolve()
     snapshot = capture_tree(base)
     command = " && ".join(contract.required_commands)
     if not command:
         raise ValueError("acceptance contract must contain a required command")
+    if timeout_seconds <= 0:
+        raise ValueError("verifier timeout must be greater than zero")
     try:
         completed = subprocess.run(
             command,
@@ -62,10 +65,17 @@ def run_verifier(
             text=True,
             capture_output=True,
             check=False,
-            timeout=300,
+            timeout=timeout_seconds,
         )
         exit_code = completed.returncode
-        outcome: VerificationOutcome = "passed" if exit_code == 0 else "code_failed"
+        if exit_code == 0:
+            outcome: VerificationOutcome = "passed"
+        elif exit_code in (126, 127):
+            outcome = "infrastructure_failed"
+        elif exit_code < 0 or exit_code >= 128:
+            outcome = "verifier_failed"
+        else:
+            outcome = "code_failed"
         output = completed.stdout + "\n" + completed.stderr
     except subprocess.TimeoutExpired as exc:
         exit_code = 124

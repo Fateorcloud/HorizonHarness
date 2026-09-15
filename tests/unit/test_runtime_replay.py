@@ -138,6 +138,29 @@ class RuntimeReplayTests(unittest.TestCase):
                     child_store / "child" / child.checkpoint.context_manifest_path
                 ).is_file()
             )
+            manifest = json.loads(
+                (
+                    child_store / "child" / child.checkpoint.context_manifest_path
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["context_manifest_version"], 1)
+            self.assertTrue(manifest["complete_boundary"])
+            self.assertEqual(manifest["task_id"], "child")
+            self.assertEqual(manifest["task_revision"], child.revision)
+            self.assertEqual(
+                manifest["message_refs"], list(child.checkpoint.message_refs)
+            )
+            self.assertEqual(manifest["snapshot_path"], child.checkpoint.snapshot_path)
+            self.assertEqual(
+                manifest["workspace_tree_sha256"],
+                child.checkpoint.workspace_tree_sha256,
+            )
+            self.assertEqual(manifest["parent_task_id"], "parent")
+            self.assertEqual(manifest["parent_revision"], parent.record.revision)
+            self.assertEqual(
+                manifest["parent_snapshot_sha256"],
+                parent.record.checkpoint.workspace_tree_sha256,
+            )
             self.assertEqual(
                 parent_session.store.journal("parent").applied_seq(), parent_seq
             )

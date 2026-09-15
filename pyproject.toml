@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
-    { name = "yesiyu.andy", email = "andyyesiyu@gmail.com" },
+    { name = "Fateorcloud", email = "121081603+Fateorcloud@users.noreply.github.com" },
 ]
 keywords = ["agent", "llm", "long-horizon", "runtime", "harness", "evaluation"]
 classifiers = [
@@ -61,9 +61,9 @@ memory = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Fateorcloud/horizon-harness"
-Repository = "https://github.com/Fateorcloud/horizon-harness"
-Issues = "https://github.com/Fateorcloud/horizon-harness/issues"
+Homepage = "https://github.com/Fateorcloud/HorizonHarness"
+Repository = "https://github.com/Fateorcloud/HorizonHarness"
+Issues = "https://github.com/Fateorcloud/HorizonHarness/issues"
 
 [dependency-groups]
 dev = [

@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import tempfile
 import unittest
 import sqlite3
@@ -29,6 +30,23 @@ class RuntimeJournalTests(unittest.TestCase):
                 )
             self.assertEqual(columns, ("batch_id", "turn_no", "calls_json"))
 
+    def test_malformed_tool_batch_plan_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = ExecutionJournal(Path(tmp) / "journal.sqlite3")
+            journal.plan_batch(
+                batch_id="batch",
+                turn_no=1,
+                calls=[{"id": "A", "name": "read", "arguments": {}}],
+            )
+            with sqlite3.connect(journal.path) as db:
+                db.execute(
+                    "UPDATE tool_batches SET calls_json=? WHERE batch_id='batch'",
+                    (json.dumps({"calls": [{"id": "A"}, "corrupt"]}),),
+                )
+
+            with self.assertRaisesRegex(ValueError, "invalid tool batch plan"):
+                journal.batch("batch")
+
     def test_historical_sealed_batch_does_not_authorize_uncommitted_turn(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = WorkspaceStore(Path(tmp) / "store")
@@ -56,6 +74,66 @@ class RuntimeJournalTests(unittest.TestCase):
 
             with self.assertRaisesRegex(UnsafeCheckpointError, "uncommitted turn"):
                 store.assert_resumable(record.task_id)
+
+    def test_sealed_terminating_batch_stops_before_the_next_model_call(self):
+        from horizon_harness.core import Agent, run
+        from horizon_harness.protocols import AgentEndEvent, TurnEndEvent
+        from horizon_harness.state import State
+        from horizon_harness.tools import text_result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = ExecutionJournal(Path(tmp) / "journal.sqlite3")
+            assistant = assistant_message(
+                (ToolCallBlock("A", "read", {}),), sender="agent", kind="step"
+            )
+            journal.commit_model_decision(
+                events=[
+                    ("MessageEvent", {"message": encode_message(assistant)}),
+                ],
+                batch_id="batch",
+                turn_no=1,
+                calls=[
+                    {
+                        "id": "A",
+                        "execution_step_id": "batch:0",
+                        "name": "read",
+                        "arguments": {},
+                    }
+                ],
+                assistant_message=encode_message(assistant),
+            )
+            result = text_result("stop", terminate=True)
+            journal.record_batch_tool_result("batch", 0, "A", result)
+            bundle = tool_results_message(
+                (ToolResultBlock("A", "read", result.content),), target="agent"
+            )
+            journal.commit_batch_bundle("batch", {"message": encode_message(bundle)})
+            state = State(task="stop")
+            for message in journal.rebuild_messages():
+                state.record(message)
+            generate = mock.Mock(
+                side_effect=AssertionError("terminated batch must not call the model")
+            )
+            agent = Agent(
+                "agent",
+                generate,
+                journal=journal,
+                recover_durable_batches=True,
+            )
+
+            events = list(run(agent, state, max_turns=1))
+
+            generate.assert_not_called()
+            turn_end = next(
+                event for event in events if isinstance(event, TurnEndEvent)
+            )
+            self.assertTrue(turn_end.terminated)
+            self.assertEqual(
+                next(
+                    event for event in events if isinstance(event, AgentEndEvent)
+                ).reason,
+                "tool_terminate",
+            )
 
     def test_reused_provider_id_has_distinct_execution_steps_across_turns(self):
         from horizon_harness.core import Agent, run

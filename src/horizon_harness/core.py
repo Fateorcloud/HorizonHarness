@@ -27,7 +27,7 @@ import dataclasses
 import uuid
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Iterator
+from typing import TYPE_CHECKING, Callable, Generator, Iterator
 
 if TYPE_CHECKING:
     from .workspace.journal import ExecutionJournal
@@ -75,8 +75,7 @@ if TYPE_CHECKING:
 # It takes no other arguments: name/role/tools/etc. are closed over at the
 # point where the function is built (see `llm_agent.py` and the test fakes).
 GenerateFn = Callable[[list[Message]], Message]
-PendingBatchRecoveryFn = Callable[[dict[str, AgentTool]], tuple[str, Message] | None]
-
+DurableRecoveryPreparationFn = Callable[[], None]
 # A state initializer builds the initial `State` for `Agent.run` from a task.
 # The default (see `Agent._default_init_state`) records a single task message; a
 # higher layer can supply one that records extra context up front — e.g. the
@@ -87,6 +86,12 @@ PendingBatchRecoveryFn = Callable[[dict[str, AgentTool]], tuple[str, Message] | 
 StateInitFn = Callable[["Agent", ContentInput], State]
 TraceStateFn = Callable[["Agent", State], State | None]
 ContextBuilderFn = Callable[[str, State, ContextPolicy], ContextView]
+
+
+@dataclass(frozen=True)
+class ToolDispatchOutcome:
+    completed: bool
+    terminated: bool = False
 
 
 @dataclass
@@ -116,10 +121,13 @@ class Agent:
     # Optional durable event sink. The core loop remains the sole state
     # transition owner; the sink only records committed event metadata.
     journal: object | None = None
-    # Optional durable recovery capability assembled by TaskSession. The core
-    # invokes it before the next model turn, so there is only one execution
-    # driver even though tool-specific reconciliation remains outside core.
-    pending_batch_recovery: PendingBatchRecoveryFn | None = None
+    # TaskSession enables durable startup phases after validating the persisted
+    # plan and binding tool-specific adapters. A plain event sink need not
+    # implement them.
+    recover_durable_batches: bool = False
+    # Tool-specific reconciliation stays behind this adapter; core alone
+    # decides when the recovery phase may advance it.
+    prepare_durable_recovery: DurableRecoveryPreparationFn | None = None
     # How `run` builds the initial `State`. `None` uses `_default_init_state`
     # (just the task message); the skills layer installs one that records the
     # skills menu first, so a bare `agent.run(task)` is skills-aware.
@@ -279,16 +287,6 @@ def run(
     hooks = agent.hooks
     api = agent.llm_provider.api if agent.llm_provider is not None else ""
 
-    if agent.pending_batch_recovery is not None:
-        recovered = agent.pending_batch_recovery(tool_by_name)
-        if recovered is not None:
-            batch_id, bundle = recovered
-            bundle_event = state.prepare_event(MessageEvent(message=bundle))
-            if journal is None:
-                raise RuntimeError("pending batch recovery requires a journal")
-            journal.commit_batch_bundle(batch_id, dataclasses.asdict(bundle_event))
-            yield state.apply_prepared_event(bundle_event)
-
     def session_hook(point: HookPoint) -> Iterator[Event]:
         _, hook_events = fire_hooks(
             hooks, HookContext(point=point, agent=name, state=state), state
@@ -300,7 +298,55 @@ def run(
     final_emitted = False
     # Default outcome; overridden when the loop breaks on `final` or terminate.
     end_reason: AgentEndReason = "max_turns"
-    for _ in range(max_turns):
+    stop_before_model = False
+    if journal is not None and agent.recover_durable_batches:
+        pending = journal.recoverable_batches()
+        cursor = journal.cursor()
+        if len(pending) > 1:
+            raise RuntimeError("multiple pending tool batches cannot be recovered")
+        if pending:
+            batch = pending[0]
+            batch_id = batch["batch_id"]
+            if cursor.get("batch_id") != batch_id:
+                raise RuntimeError("execution cursor does not identify pending batch")
+            assistant = journal.batch_assistant_message(batch_id)
+            if abort():
+                end_reason = "abort"
+                stop_before_model = True
+            else:
+                if agent.prepare_durable_recovery is not None:
+                    agent.prepare_durable_recovery()
+                recovered = yield from dispatch_tool_calls(
+                    assistant,
+                    tool_by_name,
+                    state,
+                    abort=abort,
+                    hooks=hooks,
+                    journal=journal,
+                    batch_id=batch_id,
+                )
+                if not recovered.completed:
+                    end_reason = "abort"
+                    stop_before_model = True
+                else:
+                    journal.set_cursor(turn_no=batch["turn_no"], phase="ready")
+                    yield record(
+                        TurnEndEvent(agent=name, terminated=recovered.terminated)
+                    )
+                    if recovered.terminated:
+                        end_reason = "tool_terminate"
+                        stop_before_model = True
+        elif cursor.get("phase") == "tools_pending":
+            raise RuntimeError("execution cursor references a missing pending batch")
+        elif cursor.get("phase") == "seal_pending":
+            terminated = journal.turn_has_terminating_batch(cursor["turn_no"])
+            journal.set_cursor(turn_no=cursor["turn_no"], phase="ready")
+            yield record(TurnEndEvent(agent=name, terminated=terminated))
+            if terminated:
+                end_reason = "tool_terminate"
+                stop_before_model = True
+
+    for _ in range(0 if stop_before_model else max_turns):
         if abort():
             end_reason = "abort"
             break
@@ -406,8 +452,7 @@ def run(
             final_emitted = True
 
         if tool_by_name and output_tool_calls:
-            tool_terminated = False
-            for event in dispatch_tool_calls(
+            dispatched = yield from dispatch_tool_calls(
                 output,
                 tool_by_name,
                 state,
@@ -415,11 +460,11 @@ def run(
                 hooks=hooks,
                 journal=journal,
                 batch_id=batch_id if journal is not None else None,
-            ):
-                yield event
-                if isinstance(event, ToolExecutionEndEvent) and event.terminate:
-                    tool_terminated = True
-            if tool_terminated:
+            )
+            if not dispatched.completed:
+                end_reason = "abort"
+                break
+            if dispatched.terminated:
                 yield record(TurnEndEvent(agent=name, terminated=True))
                 end_reason = "tool_terminate"
                 break
@@ -450,7 +495,7 @@ def dispatch_tool_calls(
     hooks: HookMap | None = None,
     journal: ExecutionJournal | None = None,
     batch_id: str | None = None,
-) -> Iterator[Event]:
+) -> Generator[Event, None, ToolDispatchOutcome]:
     """Run assistant tool calls and append deterministic tool-result messages.
 
     Before any call reaches the thread pool, each is run through the
@@ -462,7 +507,7 @@ def dispatch_tool_calls(
     """
     tool_calls = message_tool_calls(assistant_msg)
     if not tool_calls:
-        return
+        return ToolDispatchOutcome(completed=True)
 
     hooks = hooks or {}
     target = assistant_msg.sender or "agent"
@@ -483,6 +528,100 @@ def dispatch_tool_calls(
         if journal is not None:
             journal.append(type(stamped).__name__, dataclasses.asdict(stamped))
         return state.apply_prepared_event(stamped)
+
+    if journal is not None:
+        journal.materialize_terminal_batch_results(batch_id)
+        results = dict(journal.decoded_batch_results(batch_id))
+        terminated = any(result.terminate for result in results.values())
+        durable_batch = journal.batch(batch_id)
+        if durable_batch is None:
+            raise ValueError(f"missing durable batch: {batch_id}")
+        planned_by_id = {call["id"]: call for call in durable_batch["calls"]}
+
+        for call_index, tool_call in enumerate(tool_calls):
+            if tool_call.id in results:
+                continue
+            if abort():
+                return ToolDispatchOutcome(completed=False, terminated=terminated)
+            yield record_tool(
+                ToolExecutionStartEvent(
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                )
+            )
+            decision, hook_events = fire_hooks(
+                hooks,
+                HookContext(
+                    point=HookPoint.PRE_TOOL_USE,
+                    agent=target,
+                    state=state,
+                    tool_call=tool_call,
+                ),
+                state,
+            )
+            yield from hook_events
+            if decision.block_reason:
+                result = text_result(decision.block_reason, is_error=True)
+            else:
+                tool = tools.get(tool_call.name)
+                if tool is None:
+                    raise ValueError(f"unsupported durable tool: {tool_call.name}")
+                planned = planned_by_id.get(tool_call.id)
+                if planned is None:
+                    raise ValueError(
+                        f"durable batch has no planned call: {tool_call.id}"
+                    )
+                execution_id = (
+                    planned.get("execution_step_id", tool_call.id)
+                    if tool_call.name == "edit"
+                    else tool_call.id
+                )
+                updates: list[ToolResult] = []
+
+                def on_update(partial: ToolResult) -> None:
+                    updates.append(partial)
+
+                try:
+                    result = tool.execute(
+                        execution_id,
+                        dict(tool_call.arguments),
+                        abort,
+                        on_update,
+                    )
+                except Exception as exc:
+                    result = text_result(f"{type(exc).__name__}: {exc}", is_error=True)
+                for partial in updates:
+                    yield record_tool(
+                        ToolExecutionUpdateEvent(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            partial=partial,
+                        )
+                    )
+            results[tool_call.id] = result
+            terminated = terminated or result.terminate
+            yield record_tool(
+                ToolExecutionEndEvent(
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    is_error=result.is_error,
+                    terminate=result.terminate,
+                )
+            )
+            journal.record_batch_tool_result(batch_id, call_index, tool_call.id, result)
+            journal.set_cursor(
+                turn_no=journal.cursor()["turn_no"],
+                phase="tools_pending",
+                next_tool_index=call_index + 1,
+                batch_id=batch_id,
+            )
+
+        bundle = _tool_results_bundle(tool_calls, results, target=target)
+        bundle_event = state.prepare_event(MessageEvent(message=bundle))
+        journal.commit_batch_bundle(batch_id, dataclasses.asdict(bundle_event))
+        yield state.apply_prepared_event(bundle_event)
+        yield from _post_tool_use_events(tool_calls, hooks, target, state)
+        return ToolDispatchOutcome(completed=True, terminated=terminated)
 
     for tool_call in tool_calls:
         yield record_tool(
@@ -537,50 +676,6 @@ def dispatch_tool_calls(
 
         return on_update
 
-    if effective and journal is not None:
-        # Do not enqueue future effects before the current observation commits.
-        for call in effective:
-            tool = tools.get(call.name)
-            if tool is None:
-                raise ValueError(f"unsupported durable tool: {call.name}")
-            durable_batch = journal.batch(batch_id)
-            if durable_batch is None:
-                raise ValueError(f"missing durable batch: {batch_id}")
-            planned = durable_batch["calls"][tool_calls.index(call)]
-            execution_id = (
-                planned.get("execution_step_id", call.id)
-                if call.name == "edit"
-                else call.id
-            )
-            result = tool.execute(
-                execution_id, dict(call.arguments), abort, make_on_update(call.id)
-            )
-            results[call.id] = result
-            for partial in update_buffers[call.id]:
-                yield record_tool(
-                    ToolExecutionUpdateEvent(
-                        tool_call_id=call.id,
-                        tool_name=call.name,
-                        partial=partial,
-                    )
-                )
-            yield record_tool(
-                ToolExecutionEndEvent(
-                    tool_call_id=call.id,
-                    tool_name=call.name,
-                    is_error=result.is_error,
-                    terminate=result.terminate,
-                )
-            )
-            call_index = tool_calls.index(call)
-            journal.record_batch_tool_result(batch_id, call_index, call.id, result)
-            journal.set_cursor(
-                turn_no=journal.cursor()["turn_no"],
-                phase="tools_pending",
-                next_tool_index=call_index + 1,
-                batch_id=batch_id,
-            )
-
     if effective and journal is None:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -625,23 +720,7 @@ def dispatch_tool_calls(
     # the gate, executed ones filled by the pool). The bundle is built over the
     # original `tool_calls` so each result lands under the id and name the model
     # emitted, whether or not a hook blocked or rewrote the call.
-    bundle = tool_results_message(
-        [
-            ToolResultBlock(
-                tool_call_id=tool_call.id,
-                tool_name=tool_call.name,
-                content=tuple(results[tool_call.id].content),
-                is_error=results[tool_call.id].is_error,
-            )
-            for tool_call in tool_calls
-        ],
-        target=target,
-        sidecar={
-            "details": {
-                tool_call.id: results[tool_call.id].details for tool_call in tool_calls
-            },
-        },
-    )
+    bundle = _tool_results_bundle(tool_calls, results, target=target)
     bundle_event = state.prepare_event(MessageEvent(message=bundle))
     if journal is not None:
         journal.commit_batch_bundle(batch_id, dataclasses.asdict(bundle_event))
@@ -650,6 +729,42 @@ def dispatch_tool_calls(
     # POST_TOOL_USE fires only after the provider-required tool-result bundle is
     # in the transcript. Hooks may append reminder/context messages here without
     # orphaning the assistant tool_call -> user tool_result pair.
+    yield from _post_tool_use_events(tool_calls, hooks, target, state)
+    return ToolDispatchOutcome(
+        completed=True,
+        terminated=any(result.terminate for result in results.values()),
+    )
+
+
+def _tool_results_bundle(
+    tool_calls: tuple[ToolCallBlock, ...],
+    results: dict[str, ToolResult],
+    *,
+    target: str,
+) -> Message:
+    return tool_results_message(
+        [
+            ToolResultBlock(
+                tool_call_id=call.id,
+                tool_name=call.name,
+                content=tuple(results[call.id].content),
+                is_error=results[call.id].is_error,
+            )
+            for call in tool_calls
+        ],
+        target=target,
+        sidecar={
+            "details": {call.id: results[call.id].details for call in tool_calls},
+        },
+    )
+
+
+def _post_tool_use_events(
+    tool_calls: tuple[ToolCallBlock, ...],
+    hooks: HookMap,
+    target: str,
+    state: State,
+) -> Iterator[Event]:
     for tool_call in tool_calls:
         _, hook_events = fire_hooks(
             hooks,

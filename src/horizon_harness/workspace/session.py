@@ -9,7 +9,7 @@ import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Sequence, cast
+from typing import Callable, Iterator, Sequence, cast
 
 from horizon_harness.agents import AgentSession
 from horizon_harness.context_view import effective_token_budget
@@ -38,7 +38,6 @@ from .store import UnsafeCheckpointError, WorkspaceStore
 from .execution import (
     make_durable_edit_tool,
     reconcile_edit,
-    recover_pending_batch,
 )
 from .verification import (
     AcceptanceContract,
@@ -53,10 +52,6 @@ from .tools import (
     make_workspace_update_tool,
     make_workspace_read_tool,
 )
-
-if TYPE_CHECKING:
-    from .journal import ExecutionJournal
-
 
 WORKSPACE_INSTRUCTIONS = """
 Maintain the Task Workspace after meaningful progress with workspace_update.
@@ -411,7 +406,7 @@ class TaskSession:
         with self.store.writer(task_id):
             record = self.store.load(task_id)
             self._require_frozen_contract(record, contract)
-            if record.status in ("completed", "failed"):
+            if record.status == "failed":
                 return record
             if self.store.has_uncommitted(task_id):
                 raise UnsafeCheckpointError("completion rejected: uncommitted turn")
@@ -439,17 +434,22 @@ class TaskSession:
                 outcome=cast(VerificationOutcome, latest.outcome),
                 output_digest=latest.evidence_ref,
             )
+            evidence_revision = (
+                record.revision - 1 if record.status == "completed" else record.revision
+            )
             if not receipt_is_current(
                 receipt,
                 task_id=task_id,
                 root=self.code_dir,
                 contract=contract,
                 verifier_version=verifier_version,
-                task_revision=record.revision,
+                task_revision=evidence_revision,
             ):
                 raise UnsafeCheckpointError(
                     "completion rejected: verification evidence is stale or failed"
                 )
+            if record.status == "completed":
+                return record
             revised = replace(
                 record,
                 revision=record.revision + 1,
@@ -499,7 +499,9 @@ class TaskSession:
             raise ValueError("pause_after_turns must be greater than zero")
         run_id = uuid.uuid4().hex
         holder = [record]
-        turns = 0
+        completed_turns = record.checkpoint.completed_turn
+        turns_started_in_run = 0
+        turn_opened_in_run = False
         pause_requested = False
         captured: list[Event] = []
 
@@ -595,13 +597,6 @@ class TaskSession:
                 journal = self.store.journal(record.task_id)
                 if self.durable:
                     self._validate_pending_batches(journal)
-                    actions = reconcile_edit(
-                        journal, root=self.code_dir, retry_before=False
-                    )
-                    if any(action.startswith("ambiguous:") for action in actions):
-                        raise UnsafeCheckpointError(
-                            "automatic resume refused: controlled edit has ambiguous workspace drift"
-                        )
                 holder[0] = self._reconcile_artifacts(locked)
                 record = holder[0]
             with AgentSession(
@@ -619,6 +614,23 @@ class TaskSession:
                 bound_tools[0] = agent_session.agent.tools
                 agent_session.agent.journal = self.store.journal(record.task_id)
                 if self.durable:
+                    agent_session.agent.recover_durable_batches = True
+
+                    def prepare_durable_recovery() -> None:
+                        actions = reconcile_edit(
+                            self.store.journal(record.task_id),
+                            root=self.code_dir,
+                            retry_before=False,
+                        )
+                        if any(action.startswith("ambiguous:") for action in actions):
+                            raise UnsafeCheckpointError(
+                                "automatic resume refused: controlled edit has "
+                                "ambiguous workspace drift"
+                            )
+
+                    agent_session.agent.prepare_durable_recovery = (
+                        prepare_durable_recovery
+                    )
                     agent_session.agent.tools = tuple(
                         make_durable_edit_tool(
                             root=self.code_dir, journal=agent_session.agent.journal
@@ -626,12 +638,6 @@ class TaskSession:
                         if tool.name == "edit"
                         else tool
                         for tool in agent_session.agent.tools
-                    )
-                    agent_session.agent.pending_batch_recovery = lambda tools: (
-                        recover_pending_batch(
-                            cast("ExecutionJournal", agent_session.agent.journal),
-                            tools,  # type: ignore[arg-type]
-                        )
                     )
                 if resumed:
                     state = State(task=record.task)
@@ -659,10 +665,19 @@ class TaskSession:
                 for event in event_iter:
                     captured.append(event)
                     if isinstance(event, TurnStartEvent):
-                        self.store.begin_turn(record.task_id, run_id, turns + 1)
+                        turn_opened_in_run = True
+                        self.store.begin_turn(
+                            record.task_id, run_id, completed_turns + 1
+                        )
                     if isinstance(event, TurnEndEvent):
-                        turns += 1
-                        if pause_after_turns is not None and turns >= pause_after_turns:
+                        completed_turns += 1
+                        if turn_opened_in_run:
+                            turns_started_in_run += 1
+                            turn_opened_in_run = False
+                        if (
+                            pause_after_turns is not None
+                            and turns_started_in_run >= pause_after_turns
+                        ):
                             pause_requested = True
                         status = holder[0].status
                         resumable = status not in ("completed", "failed")
@@ -670,7 +685,7 @@ class TaskSession:
                             status = "paused"
                         checkpoint = Checkpoint(
                             run_id=run_id,
-                            completed_turn=turns,
+                            completed_turn=completed_turns,
                             resumable=resumable,
                             recent_message_refs=tuple(
                                 f"{run_id}:{index}"
@@ -701,7 +716,11 @@ class TaskSession:
                 if holder[0].status == "active":
                     holder[0] = replace(holder[0], status="paused")
                     self.store.save(holder[0])
-                if self.store.has_uncommitted(record.task_id):
+                journal = self.store.journal(record.task_id)
+                durable_pause = bool(journal.recoverable_batches()) or (
+                    journal.cursor().get("phase") == "seal_pending"
+                )
+                if self.store.has_uncommitted(record.task_id) and not durable_pause:
                     raise UnsafeCheckpointError(
                         "run ended without a complete turn; automatic resume is unsafe"
                     )

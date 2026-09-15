@@ -130,5 +130,5 @@ uv run python -m scripts.lint_docs
 bash runs/dev/run_ci.sh
 ```
 
-The project is licensed under Apache-2.0. Existing attribution and Git history
-are retained.
+The project is licensed under Apache-2.0. The root `LICENSE` file is included
+with source and package distributions.

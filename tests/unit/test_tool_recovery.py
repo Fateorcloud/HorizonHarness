@@ -11,63 +11,11 @@ from horizon_harness.workspace.journal import ExecutionJournal
 from horizon_harness.workspace.execution import (
     reconcile_edit,
     atomic_edit_write,
-    recover_batch,
 )
-from horizon_harness.tools import AgentTool, text_result
 from horizon_harness.tools.edit import edit_fingerprint
-from horizon_harness.workspace.codec import encode_tool_result
 
 
 class ToolRecoveryJournalTests(unittest.TestCase):
-    def test_recovery_message_keeps_committed_prefix_and_actual_suffix(self):
-        from horizon_harness.messages import assistant_message, ToolCallBlock
-        from horizon_harness.workspace.codec import encode_message, encode_tool_result
-        from horizon_harness.workspace.execution import recover_pending_batch
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "code"
-            root.mkdir()
-            journal = ExecutionJournal(Path(tmp) / "journal.sqlite3")
-            calls = [
-                {"id": "a", "name": "read", "arguments": {}},
-                {"id": "b", "name": "read", "arguments": {}},
-            ]
-            assistant = assistant_message(
-                tuple(ToolCallBlock(c["id"], c["name"], c["arguments"]) for c in calls)
-            )
-            journal.plan_batch(
-                batch_id="batch",
-                turn_no=1,
-                calls=calls,
-                assistant_message=encode_message(assistant),
-            )
-            first = text_result("original prefix")
-            second = text_result("original suffix", is_error=True)
-            journal.record_batch_result(
-                "batch", 0, {"call_id": "a", "tool_result": encode_tool_result(first)}
-            )
-            execute = mock.Mock(return_value=second)
-            tool = AgentTool(
-                name="read", description="", parameters={}, execute=execute
-            )
-            batch_id, result = recover_pending_batch(journal, {"read": tool})
-            self.assertEqual(batch_id, "batch")
-            self.assertEqual(
-                [block.tool_call_id for block in result.content], ["a", "b"]
-            )
-            self.assertEqual(
-                [block.content for block in result.content],
-                [first.content, second.content],
-            )
-            self.assertTrue(result.content[1].is_error)
-            execute.assert_called_once()
-            self.assertEqual(execute.call_args.args[0], "b")
-            self.assertEqual(
-                recover_pending_batch(journal, {"read": tool}),
-                ("batch", result),
-            )
-            execute.assert_called_once()
-
     def test_preplanned_edit_persists_intent_before_writing(self):
         from horizon_harness.tools import tool_arguments_hash
         from horizon_harness.workspace.execution import make_durable_edit_tool
@@ -129,43 +77,6 @@ class ToolRecoveryJournalTests(unittest.TestCase):
             self.assertEqual(process.stdout.strip(), expected)
         with self.assertRaises(ValueError):
             tool_arguments_hash({"bad": float("nan")})
-
-    def test_recover_batch_executes_only_remaining_calls(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            journal = ExecutionJournal(Path(tmp) / "journal.sqlite3")
-            journal.plan_batch(
-                batch_id="b",
-                turn_no=1,
-                calls=[
-                    {"id": "a", "name": "touch", "arguments": {}},
-                    {"id": "b", "name": "touch", "arguments": {}},
-                ],
-            )
-            journal.record_batch_result(
-                "b",
-                0,
-                {
-                    "call_id": "a",
-                    "tool_result": encode_tool_result(text_result("already done")),
-                },
-            )
-            seen = []
-            tool = AgentTool(
-                name="touch",
-                description="",
-                parameters={},
-                execution_mode="sequential",
-                execute=lambda cid, args, abort, update: (
-                    seen.append(cid) or text_result("ok")
-                ),
-            )
-            self.assertEqual(len(recover_batch(journal, "b", {"touch": tool})), 1)
-            self.assertEqual(seen, ["b"])
-            self.assertEqual(journal.batch("b")["next_tool_index"], 2)
-            self.assertEqual(
-                tuple(row["call_id"] for row in journal.batch_results("b")),
-                ("a", "b"),
-            )
 
     def test_atomic_edit_keeps_original_on_replace_failure(self):
         with tempfile.TemporaryDirectory() as tmp:

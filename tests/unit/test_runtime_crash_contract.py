@@ -6,10 +6,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from horizon_harness.llm.env import FAKE_PROVIDER
 from horizon_harness.llm.types import LLMResponse
 from horizon_harness.messages import TextBlock, ToolCallBlock
+from horizon_harness.protocols import ToolExecutionEndEvent, ToolExecutionStartEvent
 from horizon_harness.workspace import TaskSession
 
 
@@ -220,10 +222,61 @@ class RuntimeCrashContractTests(unittest.TestCase):
                     model="fake-model",
                 )
 
-            TaskSession(
-                FAKE_PROVIDER, code_dir=root, store_dir=store, complete_fn=next_model
-            ).resume("crash-C")
+            from horizon_harness.workspace.execution import atomic_edit_write
+
+            with mock.patch(
+                "horizon_harness.workspace.execution.atomic_edit_write",
+                wraps=atomic_edit_write,
+            ) as writes:
+                TaskSession(
+                    FAKE_PROVIDER,
+                    code_dir=root,
+                    store_dir=store,
+                    complete_fn=next_model,
+                ).resume("crash-C")
             self.assertEqual(len(calls), 1)
+            self.assertEqual(writes.call_count, 1)
+
+    def test_C_workspace_drift_blocks_recovery_before_any_new_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._prepare_code(directory)
+            store = Path(directory) / "store"
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tests.unit.test_runtime_crash_contract",
+                    str(root),
+                    str(store),
+                    "C",
+                ],
+                timeout=30,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(process.returncode, 91, process.stderr)
+            (root / "b.txt").write_text("external-change", encoding="utf-8")
+            from horizon_harness.workspace.execution import atomic_edit_write
+            from horizon_harness.workspace.store import UnsafeCheckpointError
+
+            with mock.patch(
+                "horizon_harness.workspace.execution.atomic_edit_write",
+                wraps=atomic_edit_write,
+            ) as writes:
+                with self.assertRaisesRegex(UnsafeCheckpointError, "ambiguous"):
+                    TaskSession(
+                        FAKE_PROVIDER,
+                        code_dir=root,
+                        store_dir=store,
+                        complete_fn=lambda request: self.fail(
+                            "model must not be called"
+                        ),
+                    ).resume("crash-C")
+            writes.assert_not_called()
+            self.assertEqual(
+                tuple((root / f"{name}.txt").read_text() for name in ("a", "b", "c")),
+                ("1", "external-change", "0"),
+            )
 
     def test_A_committed_decision_resumes_without_regenerating_tools(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -258,10 +311,102 @@ class RuntimeCrashContractTests(unittest.TestCase):
                     model="fake-model",
                 )
 
-            TaskSession(
-                FAKE_PROVIDER, code_dir=root, store_dir=store, complete_fn=next_model
-            ).resume("crash-A")
+            from horizon_harness.workspace.execution import atomic_edit_write
+
+            with mock.patch(
+                "horizon_harness.workspace.execution.atomic_edit_write",
+                wraps=atomic_edit_write,
+            ) as writes:
+                TaskSession(
+                    FAKE_PROVIDER,
+                    code_dir=root,
+                    store_dir=store,
+                    complete_fn=next_model,
+                ).resume("crash-A")
             self.assertEqual(len(calls), 1)
+            self.assertEqual(writes.call_count, 3)
+
+    def test_A_cancelled_resume_has_no_tool_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._prepare_code(directory)
+            store = Path(directory) / "store"
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tests.unit.test_runtime_crash_contract",
+                    str(root),
+                    str(store),
+                ],
+                timeout=30,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(process.returncode, 91, process.stderr)
+            model_calls = []
+
+            def unexpected_model(request):
+                model_calls.append(request)
+                return LLMResponse(
+                    content=(TextBlock("unexpected"),),
+                    stop_reason="end_turn",
+                    model="fake-model",
+                )
+
+            result = TaskSession(
+                FAKE_PROVIDER,
+                code_dir=root,
+                store_dir=store,
+                complete_fn=unexpected_model,
+            ).resume("crash-A", abort=lambda: True)
+
+            self.assertEqual(result.status, "paused")
+            self.assertEqual(model_calls, [])
+            self.assertEqual(
+                tuple((root / f"{name}.txt").read_text() for name in ("a", "b", "c")),
+                ("0", "0", "0"),
+            )
+            from horizon_harness.workspace.journal import ExecutionJournal
+
+            journal = ExecutionJournal(store / "crash-A" / "journal.sqlite3")
+            self.assertEqual(len(journal.recoverable_batches()), 1)
+
+    def test_A_resume_checks_cancellation_before_each_pending_tool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._prepare_code(directory)
+            store = Path(directory) / "store"
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tests.unit.test_runtime_crash_contract",
+                    str(root),
+                    str(store),
+                ],
+                timeout=30,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(process.returncode, 91, process.stderr)
+            checks = 0
+
+            def cancelled_after_entry_check():
+                nonlocal checks
+                checks += 1
+                return checks > 1
+
+            result = TaskSession(
+                FAKE_PROVIDER,
+                code_dir=root,
+                store_dir=store,
+                complete_fn=lambda request: self.fail("model must not be called"),
+            ).resume("crash-A", abort=cancelled_after_entry_check)
+
+            self.assertEqual(result.status, "paused")
+            self.assertEqual(
+                tuple((root / f"{name}.txt").read_text() for name in ("a", "b", "c")),
+                ("0", "0", "0"),
+            )
 
     def test_A_three_call_batch_preserves_order_and_ids_on_resume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -297,6 +442,52 @@ class RuntimeCrashContractTests(unittest.TestCase):
                 FAKE_PROVIDER, code_dir=root, store_dir=store, complete_fn=next_model
             ).resume("crash-two")
             self.assertEqual(len(calls), 1)
+
+    def test_A_recovery_uses_the_normal_tool_event_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._prepare_code(directory)
+            store = Path(directory) / "store"
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tests.unit.test_runtime_crash_contract",
+                    str(root),
+                    str(store),
+                ],
+                timeout=30,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(process.returncode, 91, process.stderr)
+
+            result = TaskSession(
+                FAKE_PROVIDER,
+                code_dir=root,
+                store_dir=store,
+                complete_fn=lambda request: LLMResponse(
+                    content=(TextBlock("done"),),
+                    stop_reason="end_turn",
+                    model="fake-model",
+                ),
+            ).resume("crash-A")
+
+            self.assertEqual(
+                tuple(
+                    event.tool_call_id
+                    for event in result.events
+                    if isinstance(event, ToolExecutionStartEvent)
+                ),
+                ("A", "B", "C"),
+            )
+            self.assertEqual(
+                tuple(
+                    event.tool_call_id
+                    for event in result.events
+                    if isinstance(event, ToolExecutionEndEvent)
+                ),
+                ("A", "B", "C"),
+            )
 
     def test_D_bundle_commit_is_atomic_by_batch_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -423,10 +614,20 @@ class RuntimeCrashContractTests(unittest.TestCase):
                     model="fake-model",
                 )
 
-            TaskSession(
-                FAKE_PROVIDER, code_dir=root, store_dir=store, complete_fn=next_model
-            ).resume("crash-B")
+            from horizon_harness.workspace.execution import atomic_edit_write
+
+            with mock.patch(
+                "horizon_harness.workspace.execution.atomic_edit_write",
+                wraps=atomic_edit_write,
+            ) as writes:
+                TaskSession(
+                    FAKE_PROVIDER,
+                    code_dir=root,
+                    store_dir=store,
+                    complete_fn=next_model,
+                ).resume("crash-B")
             self.assertEqual(len(calls), 1)
+            self.assertEqual(writes.call_count, 2)
 
     def test_recovery_can_crash_again_and_resume_the_same_decision(self):
         with tempfile.TemporaryDirectory() as directory:

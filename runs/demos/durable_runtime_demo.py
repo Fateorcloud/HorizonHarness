@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import uuid
@@ -16,6 +17,25 @@ from horizon_harness.messages import TextBlock, ToolCallBlock
 from horizon_harness.workspace import TaskSession
 from horizon_harness.workspace.replay import replay
 from horizon_harness.workspace.verification import AcceptanceContract
+
+
+_DEMO_VERIFIER = """\
+from pathlib import Path
+
+expected = {"a.txt": "1", "b.txt": "2", "c.txt": "3"}
+for name, value in expected.items():
+    actual = Path(name).read_text(encoding="utf-8")
+    if actual != value:
+        raise SystemExit(f"{name}: expected {value!r}, got {actual!r}")
+"""
+
+
+def demo_acceptance_contract() -> AcceptanceContract:
+    """Return the exact contract frozen into the demo task."""
+    return AcceptanceContract(
+        "demo-contract-v1",
+        (f"{shlex.quote(sys.executable)} verify_demo.py",),
+    )
 
 
 def _decision() -> LLMResponse:
@@ -49,7 +69,7 @@ def _crashing_start(code_dir: Path, store_dir: Path) -> None:
         return result
 
     ExecutionJournal.commit_model_decision = commit_then_exit
-    contract = AcceptanceContract("demo-contract-v1", ("true",))
+    contract = demo_acceptance_contract()
     TaskSession(
         FAKE_PROVIDER,
         code_dir=code_dir,
@@ -69,6 +89,7 @@ def run_demo(output: Path) -> dict[str, object]:
     code_dir.mkdir()
     for name in ("a", "b", "c"):
         (code_dir / f"{name}.txt").write_text("0", encoding="utf-8")
+    (code_dir / "verify_demo.py").write_text(_DEMO_VERIFIER, encoding="utf-8")
     crashed = subprocess.run(
         [
             sys.executable,
@@ -115,7 +136,7 @@ def run_demo(output: Path) -> dict[str, object]:
         complete_fn=finish,
     )
     session.resume("durable-demo", pause_after_turns=1)
-    contract = AcceptanceContract("demo-contract-v1", ("true",))
+    contract = demo_acceptance_contract()
     receipt = session.verify("durable-demo", contract)
     completed = session.complete_if_verified("durable-demo", contract)
     journal = session.store.journal("durable-demo")
