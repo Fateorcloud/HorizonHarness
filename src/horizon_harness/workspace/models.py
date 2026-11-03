@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from .snapshot import FileEntry, FileTreeSnapshot
+
 
 StepStatus = Literal["pending", "in_progress", "done", "blocked"]
 TaskStatus = Literal["active", "paused", "completed", "blocked", "failed"]
@@ -52,6 +54,16 @@ class VerifierResult:
     verifier_version: str = ""
     task_revision: int = 0
     outcome: str = ""
+    acceptance_tree_sha256: str = ""
+    verification_exclude_dirs: tuple[str, ...] | None = None
+    workspace_changes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.verification_exclude_dirs is not None:
+            object.__setattr__(
+                self, "verification_exclude_dirs", tuple(self.verification_exclude_dirs)
+            )
+        object.__setattr__(self, "workspace_changes", tuple(self.workspace_changes))
 
 
 @dataclass(frozen=True)
@@ -95,6 +107,10 @@ class WorkspaceRecord:
     parent_task_id: str = ""
     parent_revision: int = -1
     parent_snapshot_sha256: str = ""
+    acceptance_dir: str = ""
+    acceptance_tree_sha256: str = ""
+    acceptance_snapshot: FileTreeSnapshot | None = None
+    verification_exclude_dirs: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -133,6 +149,7 @@ def record_from_dict(value: dict[str, Any]) -> WorkspaceRecord:
             f"unsupported workspace schema_version {version!r}; expected 1"
         )
     checkpoint = value.get("checkpoint", {})
+    acceptance_snapshot = value.get("acceptance_snapshot")
     return WorkspaceRecord(
         schema_version=1,
         task_id=str(value["task_id"]),
@@ -196,4 +213,22 @@ def record_from_dict(value: dict[str, Any]) -> WorkspaceRecord:
         parent_task_id=str(value.get("parent_task_id", "")),
         parent_revision=int(value.get("parent_revision", -1)),
         parent_snapshot_sha256=str(value.get("parent_snapshot_sha256", "")),
+        acceptance_dir=str(value.get("acceptance_dir", "")),
+        acceptance_tree_sha256=str(value.get("acceptance_tree_sha256", "")),
+        acceptance_snapshot=(
+            FileTreeSnapshot(
+                root=acceptance_snapshot["root"],
+                entries=tuple(
+                    FileEntry(**row) for row in acceptance_snapshot["entries"]
+                ),
+                tree_sha256=acceptance_snapshot["tree_sha256"],
+            )
+            if acceptance_snapshot is not None
+            else None
+        ),
+        verification_exclude_dirs=(
+            tuple(value["verification_exclude_dirs"])
+            if value.get("verification_exclude_dirs") is not None
+            else None
+        ),
     )

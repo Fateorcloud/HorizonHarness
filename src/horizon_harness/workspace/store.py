@@ -19,7 +19,8 @@ from horizon_harness.trace.jsonl import write_jsonl_atomic
 from .codec import decode_message, encode_message
 from .models import WorkspaceRecord, record_from_dict
 from .journal import ExecutionJournal
-from .snapshot import capture_tree, write_snapshot
+from .snapshot import FileTreeSnapshot, capture_tree, write_snapshot
+from .verification import AcceptanceContract, validate_acceptance_directory
 
 
 class UnsafeCheckpointError(RuntimeError):
@@ -42,13 +43,77 @@ class WorkspaceStore:
         acceptance_contract_id: str = "",
         acceptance_contract_version: int = 0,
         acceptance_commands: Sequence[str] = (),
+        acceptance_contract: AcceptanceContract | None = None,
+        code_dir: str | Path | None = None,
+        acceptance_snapshot: FileTreeSnapshot | None = None,
+        acceptance_object_dir: str | Path | None = None,
         task_id: str | None = None,
     ) -> WorkspaceRecord:
         if not task.strip():
             raise ValueError("task must not be empty")
         resolved_id = task_id or uuid.uuid4().hex
         directory = self.task_dir(resolved_id)
+        if acceptance_snapshot is not None and (
+            acceptance_contract is None or acceptance_contract.acceptance_dir is None
+        ):
+            raise ValueError("frozen acceptance snapshot requires acceptance_dir")
+        if (
+            acceptance_contract is not None
+            and acceptance_contract.acceptance_dir is not None
+        ):
+            if code_dir is None:
+                raise ValueError("code_dir is required to freeze acceptance_dir")
+            acceptance_root = Path(acceptance_contract.acceptance_dir)
+            code_root = Path(code_dir).expanduser().resolve()
+            if acceptance_root.is_relative_to(code_root) or code_root.is_relative_to(
+                acceptance_root
+            ):
+                raise ValueError(
+                    "acceptance_dir must be outside and not contain code_dir"
+                )
+            if acceptance_snapshot is None:
+                validate_acceptance_directory(
+                    acceptance_contract.acceptance_dir, code_dir=code_dir
+                )
         directory.mkdir(parents=True, exist_ok=False)
+        if acceptance_contract is not None:
+            acceptance_contract_id = acceptance_contract.contract_id
+            acceptance_contract_version = acceptance_contract.version
+            acceptance_commands = acceptance_contract.required_commands
+            if acceptance_contract.acceptance_dir is not None:
+                objects = directory / "snapshot-objects"
+                if acceptance_snapshot is None:
+                    acceptance_snapshot = capture_tree(
+                        acceptance_contract.acceptance_dir, object_dir=objects
+                    )
+                else:
+                    # Fork from the parent's frozen bytes, never from today's
+                    # mutable source acceptance directory.
+                    if acceptance_object_dir is None:
+                        raise ValueError(
+                            "fork acceptance snapshot requires its object directory"
+                        )
+                    objects.mkdir(parents=True, exist_ok=True)
+                    for entry in acceptance_snapshot.entries:
+                        source = Path(acceptance_object_dir) / (
+                            entry.object_name or entry.sha256
+                        )
+                        content = source.read_bytes()
+                        if hashlib.sha256(content).hexdigest() != entry.sha256:
+                            raise ValueError(
+                                f"snapshot object missing or corrupt: {entry.path}"
+                            )
+                        (objects / (entry.object_name or entry.sha256)).write_bytes(
+                            content
+                        )
+                if (
+                    acceptance_contract.acceptance_tree_sha256 is not None
+                    and acceptance_contract.acceptance_tree_sha256
+                    != acceptance_snapshot.tree_sha256
+                ):
+                    raise ValueError(
+                        "acceptance tree hash does not match the declared hash"
+                    )
         record = WorkspaceRecord(
             schema_version=1,
             task_id=resolved_id,
@@ -59,6 +124,16 @@ class WorkspaceStore:
             acceptance_contract_id=acceptance_contract_id,
             acceptance_contract_version=acceptance_contract_version,
             acceptance_commands=tuple(acceptance_commands),
+            acceptance_dir=str(acceptance_contract.acceptance_dir or "")
+            if acceptance_contract
+            else "",
+            acceptance_tree_sha256=acceptance_snapshot.tree_sha256
+            if acceptance_snapshot
+            else "",
+            acceptance_snapshot=acceptance_snapshot,
+            verification_exclude_dirs=acceptance_contract.verification_exclude_dirs
+            if acceptance_contract
+            else None,
         )
         self.save(record)
         return record
@@ -95,6 +170,20 @@ class WorkspaceStore:
         event_kind: str = "WorkspaceUpdated",
         event_payload: dict[str, Any] | None = None,
     ) -> None:
+        previous = self.journal(record.task_id).projection()
+        if previous is not None:
+            frozen = record_from_dict(previous)
+            for name in (
+                "acceptance_contract_id",
+                "acceptance_contract_version",
+                "acceptance_commands",
+                "acceptance_dir",
+                "acceptance_tree_sha256",
+                "acceptance_snapshot",
+                "verification_exclude_dirs",
+            ):
+                if getattr(frozen, name) != getattr(record, name):
+                    raise ValueError(f"cannot change frozen acceptance field: {name}")
         payload = event_payload or {"revision": record.revision}
         self.journal(record.task_id).commit_projection(
             event_kind, payload, record.as_dict()

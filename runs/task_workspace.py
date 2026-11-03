@@ -69,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--acceptance", action="append", default=[])
     start.add_argument("--check", action="append", default=[])
     start.add_argument("--contract-id", default="cli-contract-v1")
+    start.add_argument("--acceptance-dir", type=Path)
+    start.add_argument("--verification-exclude-dir", action="append", default=[])
     _run_args(start)
     resume = sub.add_parser("resume")
     resume.add_argument("task_id")
@@ -210,7 +212,14 @@ def main(argv: list[str] | None = None) -> int:
             code_dir=args.code_dir,
             store_dir=args.store_dir,
         )
-        contract = AcceptanceContract(args.contract_id, tuple(args.check))
+        frozen = session.inspect(args.task_id)
+        contract = AcceptanceContract(
+            args.contract_id,
+            tuple(args.check),
+            acceptance_dir=frozen.acceptance_dir or None,
+            acceptance_tree_sha256=frozen.acceptance_tree_sha256,
+            verification_exclude_dirs=frozen.verification_exclude_dirs or (),
+        )
         if args.command == "verify":
             receipt = session.verify(args.task_id, contract)
             print(json.dumps(dataclasses.asdict(receipt), ensure_ascii=False, indent=2))
@@ -274,12 +283,21 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     if args.command == "start":
+        if (args.acceptance_dir or args.verification_exclude_dir) and not args.check:
+            raise SystemExit(
+                "--acceptance-dir and --verification-exclude-dir require --check"
+            )
         result = session.start(
             args.task,
             constraints=args.constraint,
             acceptance=args.acceptance,
             acceptance_contract=(
-                AcceptanceContract(args.contract_id, tuple(args.check))
+                AcceptanceContract(
+                    args.contract_id,
+                    tuple(args.check),
+                    acceptance_dir=args.acceptance_dir,
+                    verification_exclude_dirs=tuple(args.verification_exclude_dir),
+                )
                 if args.check
                 else None
             ),

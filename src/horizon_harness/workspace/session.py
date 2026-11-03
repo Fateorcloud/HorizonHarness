@@ -42,6 +42,7 @@ from .execution import (
 from .drift import adopt_current, drifted_step_ids, drift_resume_message
 from .verification import (
     AcceptanceContract,
+    DEFAULT_VERIFICATION_EXCLUDE_DIRS,
     VerificationOutcome,
     VerificationReceipt,
     run_verifier,
@@ -212,6 +213,8 @@ class TaskSession:
             acceptance_commands=(
                 acceptance_contract.required_commands if acceptance_contract else ()
             ),
+            acceptance_contract=acceptance_contract,
+            code_dir=self.code_dir,
             task_id=task_id,
         )
         return self._drive(
@@ -295,6 +298,23 @@ class TaskSession:
                 acceptance_contract_id=parent.acceptance_contract_id,
                 acceptance_contract_version=parent.acceptance_contract_version,
                 acceptance_commands=parent.acceptance_commands,
+                acceptance_contract=(
+                    AcceptanceContract(
+                        parent.acceptance_contract_id,
+                        parent.acceptance_commands,
+                        version=parent.acceptance_contract_version,
+                        acceptance_dir=parent.acceptance_dir or None,
+                        acceptance_tree_sha256=parent.acceptance_tree_sha256,
+                        verification_exclude_dirs=parent.verification_exclude_dirs
+                        or (),
+                    )
+                    if parent.verification_exclude_dirs is not None
+                    or parent.acceptance_dir
+                    else None
+                ),
+                code_dir=child_code_dir,
+                acceptance_snapshot=parent.acceptance_snapshot,
+                acceptance_object_dir=self.store.task_dir(task_id) / "snapshot-objects",
                 task_id=child_task_id,
             )
             child_session = TaskSession(
@@ -389,17 +409,20 @@ class TaskSession:
         """Run a deterministic verifier and persist its current-tree receipt."""
         with self.store.writer(task_id):
             record = self.store.load(task_id)
-            self._require_frozen_contract(record, contract)
+            contract = self._require_frozen_contract(record, contract)
             receipt = run_verifier(
                 task_id,
                 self.code_dir,
                 contract,
                 verifier_version=verifier_version,
                 task_revision=record.revision + 1,
+                acceptance_snapshot=record.acceptance_snapshot,
+                object_dir=self.store.task_dir(task_id) / "snapshot-objects",
+                store_dir=self.store.root,
             )
             result = VerifierResult(
                 command=receipt.command,
-                passed=receipt.exit_code == 0,
+                passed=receipt.outcome == "passed" and receipt.exit_code == 0,
                 exit_code=receipt.exit_code,
                 evidence_ref=receipt.output_digest,
                 tree_sha256=receipt.tree_sha256,
@@ -408,6 +431,9 @@ class TaskSession:
                 verifier_version=receipt.verifier_version,
                 task_revision=receipt.task_revision,
                 outcome=receipt.outcome,
+                acceptance_tree_sha256=receipt.acceptance_tree_sha256,
+                verification_exclude_dirs=receipt.verification_exclude_dirs,
+                workspace_changes=receipt.workspace_changes,
             )
             revised = replace(
                 record,
@@ -427,7 +453,7 @@ class TaskSession:
         """Commit completed only when a current successful receipt exists."""
         with self.store.writer(task_id):
             record = self.store.load(task_id)
-            self._require_frozen_contract(record, contract)
+            contract = self._require_frozen_contract(record, contract)
             if record.status == "failed":
                 return record
             if self.store.has_uncommitted(task_id):
@@ -442,6 +468,13 @@ class TaskSession:
                     "completion rejected: no verification evidence"
                 )
             latest = record.verifier_results[-1]
+            if (
+                record.verification_exclude_dirs is not None
+                and latest.verification_exclude_dirs != record.verification_exclude_dirs
+            ):
+                raise UnsafeCheckpointError(
+                    "completion rejected: verification exclusion rules do not match frozen contract"
+                )
             from .verification import receipt_is_current
 
             receipt = VerificationReceipt(
@@ -455,6 +488,9 @@ class TaskSession:
                 exit_code=latest.exit_code,
                 outcome=cast(VerificationOutcome, latest.outcome),
                 output_digest=latest.evidence_ref,
+                acceptance_tree_sha256=latest.acceptance_tree_sha256,
+                verification_exclude_dirs=latest.verification_exclude_dirs,
+                workspace_changes=latest.workspace_changes,
             )
             evidence_revision = (
                 record.revision - 1 if record.status == "completed" else record.revision
@@ -899,21 +935,31 @@ class TaskSession:
     @staticmethod
     def _require_frozen_contract(
         record: WorkspaceRecord, contract: AcceptanceContract
-    ) -> None:
+    ) -> AcceptanceContract:
         frozen = (
             record.acceptance_contract_id,
             record.acceptance_contract_version,
             record.acceptance_commands,
+            record.acceptance_dir,
+            record.acceptance_tree_sha256,
+            record.verification_exclude_dirs
+            or tuple(sorted(DEFAULT_VERIFICATION_EXCLUDE_DIRS)),
         )
         supplied = (
             contract.contract_id,
             contract.version,
             contract.required_commands,
+            str(contract.acceptance_dir or ""),
+            record.acceptance_tree_sha256
+            if contract.acceptance_tree_sha256 is None
+            else contract.acceptance_tree_sha256,
+            contract.verification_exclude_dirs,
         )
         if not frozen[0] or frozen != supplied:
             raise UnsafeCheckpointError(
                 "verification contract does not match the frozen task acceptance contract"
             )
+        return replace(contract, acceptance_tree_sha256=record.acceptance_tree_sha256)
 
     def _require_code_identity(self, record: WorkspaceRecord) -> None:
         expected = record.checkpoint.code_identity
