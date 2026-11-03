@@ -39,6 +39,7 @@ from .execution import (
     make_durable_edit_tool,
     reconcile_edit,
 )
+from .drift import adopt_current, drifted_step_ids, drift_resume_message
 from .verification import (
     AcceptanceContract,
     VerificationOutcome,
@@ -239,6 +240,27 @@ class TaskSession:
 
     def inspect(self, task_id: str) -> WorkspaceRecord:
         return self.store.load(task_id)
+
+    def adopt_current(
+        self,
+        task_id: str,
+        *,
+        step_id: str,
+        expected_sha: str,
+        note: str = "",
+    ) -> dict[str, object]:
+        """Adopt observed external bytes without executing any workspace tool."""
+        with self.store.writer(task_id):
+            record = self.store.load(task_id)
+            self._require_code_identity(record)
+            result = adopt_current(
+                self.store.journal(task_id),
+                root=self.code_dir,
+                step_id=step_id,
+                expected_sha=expected_sha,
+                note=note,
+            )
+            return {"task_id": task_id, **result}
 
     def fork_task(
         self,
@@ -617,15 +639,32 @@ class TaskSession:
                     agent_session.agent.recover_durable_batches = True
 
                     def prepare_durable_recovery() -> None:
+                        drifted = drifted_step_ids(self.store.journal(record.task_id))
+                        if drifted:
+                            raise UnsafeCheckpointError(
+                                drift_resume_message(record.task_id, drifted[0])
+                            )
                         actions = reconcile_edit(
                             self.store.journal(record.task_id),
                             root=self.code_dir,
                             retry_before=False,
                         )
-                        if any(action.startswith("ambiguous:") for action in actions):
+                        ambiguous = next(
+                            (
+                                action
+                                for action in actions
+                                if action.startswith("ambiguous:")
+                            ),
+                            None,
+                        )
+                        if ambiguous is not None:
                             raise UnsafeCheckpointError(
-                                "automatic resume refused: controlled edit has "
-                                "ambiguous workspace drift"
+                                drift_resume_message(
+                                    record.task_id,
+                                    ambiguous.removeprefix("ambiguous:").removesuffix(
+                                        ":workspace drift"
+                                    ),
+                                )
                             )
 
                     agent_session.agent.prepare_durable_recovery = (

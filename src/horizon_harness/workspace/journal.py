@@ -362,7 +362,7 @@ class ExecutionJournal:
             payload = step.get("result_payload") if step else None
             if (
                 step
-                and step.get("state") in ("succeeded", "failed")
+                and step.get("state") in ("succeeded", "failed", "cancelled")
                 and isinstance(payload, dict)
             ):
                 if isinstance(payload.get("tool_result"), dict):
@@ -489,6 +489,181 @@ class ExecutionJournal:
                 ),
             )
 
+    def cancel_drift_edit(
+        self,
+        step_id: str,
+        *,
+        expected_payload: dict[str, Any],
+        sha256: str,
+        note: str = "",
+    ) -> tuple[str, ...]:
+        """Commit human adoption, suffix cancellations and results as one fact set."""
+        from horizon_harness.tools import text_result
+        from .codec import encode_tool_result
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT tool_name, state, effect_class, result_payload FROM execution_steps WHERE step_id=?",
+                (step_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row[:3] != ("edit", "ambiguous", "idempotent_effect")
+                or json.loads(row[3] or "{}") != expected_payload
+                or expected_payload.get("reason") != "workspace drift"
+            ):
+                raise ValueError(
+                    f"step {step_id!r} must be an ambiguous controlled edit with workspace drift"
+                )
+            owners = []
+            for batch_id, encoded in db.execute(
+                "SELECT batch_id, calls_json FROM tool_batches"
+            ):
+                plan = json.loads(encoded)
+                calls = plan if isinstance(plan, list) else plan["calls"]
+                for index, call in enumerate(calls):
+                    if call.get("execution_step_id") == step_id:
+                        owners.append((batch_id, calls, index))
+            if len(owners) != 1:
+                raise ValueError(
+                    f"drift step must belong to exactly one tool batch: {step_id}"
+                )
+            batch_id, calls, adopted_index = owners[0]
+            if self._bundle_commit_exists(db, batch_id):
+                raise ValueError("batch already committed")
+            result_rows = db.execute(
+                "SELECT call_index FROM tool_batch_results WHERE batch_id=? ORDER BY call_index",
+                (batch_id,),
+            ).fetchall()
+            indices = tuple(row[0] for row in result_rows)
+            if indices != tuple(range(len(indices))) or adopted_index < len(indices):
+                raise ValueError(
+                    "drift adoption requires an uncommitted result in an ordered batch"
+                )
+
+            # A start event counts as evidence even if the tool never saved a payload.
+            facts = [
+                (seq, kind, json.loads(raw))
+                for seq, kind, raw in db.execute(
+                    "SELECT seq, kind, payload FROM journal WHERE kind IN "
+                    "('ToolBatchPlan', 'ToolExecutionStartEvent', 'StepResultCommitted', 'StepRetryStarted')"
+                )
+            ]
+            plan_seq = max(
+                (
+                    seq
+                    for seq, kind, fact in facts
+                    if kind == "ToolBatchPlan" and fact.get("batch_id") == batch_id
+                ),
+                default=0,
+            )
+            started_calls = {
+                fact.get("tool_call_id")
+                for seq, kind, fact in facts
+                if seq > plan_seq and kind == "ToolExecutionStartEvent"
+            }
+            evidenced_steps = {
+                fact.get("step_id")
+                for _, kind, fact in facts
+                if kind in ("StepResultCommitted", "StepRetryStarted")
+            }
+            cancelled = []
+            for index, call in enumerate(calls):
+                if index < adopted_index:
+                    continue
+                current_id = call.get("execution_step_id")
+                step = db.execute(
+                    "SELECT state, attempt, result_payload FROM execution_steps WHERE step_id=?",
+                    (current_id,),
+                ).fetchone()
+                if step is None:
+                    raise ValueError(f"missing batch execution step: {current_id}")
+                payload = json.loads(step[2]) if step[2] else {}
+                if index != adopted_index and (
+                    step[0] != "planned"
+                    or step[1] != 1
+                    or payload
+                    or current_id in evidenced_steps
+                    or call.get("id") in started_calls
+                ):
+                    continue
+                if index == adopted_index:
+                    reason = "adopted_external_content"
+                    message = (
+                        f"文件 {payload['path']} 在任务中断期间被外部修改，"
+                        f"操作人员已采用当前内容（sha256 {sha256}）；"
+                        "本次编辑未执行，修改前请先重新读取该文件"
+                    )
+                    payload.update(reason=reason, sha256=sha256, note=note)
+                else:
+                    payload.update(
+                        reason="cancelled_after_adopted_edit", cancelled_by=step_id
+                    )
+                    message = "因前序编辑被取消而未执行，请重新规划"
+                payload["tool_result"] = encode_tool_result(
+                    text_result(message, is_error=True)
+                )
+                self._append_step_event(
+                    db,
+                    "StepResultCommitted",
+                    {
+                        "step_id": current_id,
+                        "state": "cancelled",
+                        "result_payload": payload,
+                    },
+                )
+                db.execute(
+                    "UPDATE execution_steps SET state='cancelled', result_payload=? WHERE step_id=?",
+                    (
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        current_id,
+                    ),
+                )
+                cancelled.append(current_id)
+
+            # Preserve the ordered-prefix contract, including completed results
+            # whose tool effect committed before a process exit.
+            for index in range(len(indices), len(calls)):
+                call = calls[index]
+                step = db.execute(
+                    "SELECT state, result_payload FROM execution_steps WHERE step_id=?",
+                    (call.get("execution_step_id"),),
+                ).fetchone()
+                payload = json.loads(step[1]) if step and step[1] else {}
+                stored = payload.get("tool_result")
+                if (
+                    not step
+                    or step[0] not in ("succeeded", "failed", "cancelled")
+                    or not isinstance(stored, dict)
+                ):
+                    break
+                result = {
+                    "call_id": call["id"],
+                    "is_error": stored["is_error"],
+                    "terminate": stored["terminate"],
+                    "details": stored["details"],
+                    "tool_result": stored,
+                }
+                db.execute(
+                    "INSERT INTO tool_batch_results(batch_id, call_index, result_json) VALUES (?, ?, ?)",
+                    (
+                        batch_id,
+                        index,
+                        json.dumps(result, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+                self._append_step_event(
+                    db,
+                    "ToolBatchResultCommitted",
+                    {
+                        "batch_id": batch_id,
+                        "call_index": index,
+                        "result": result,
+                    },
+                )
+            return tuple(cancelled)
+
     @staticmethod
     def _bundle_commit_exists(db: sqlite3.Connection, batch_id: str) -> bool:
         rows = db.execute(
@@ -531,7 +706,7 @@ class ExecutionJournal:
             stored = payload.get("tool_result") if isinstance(payload, dict) else None
             if (
                 step
-                and step.get("state") in ("succeeded", "failed")
+                and step.get("state") in ("succeeded", "failed", "cancelled")
                 and isinstance(stored, dict)
             ):
                 from .codec import decode_tool_result

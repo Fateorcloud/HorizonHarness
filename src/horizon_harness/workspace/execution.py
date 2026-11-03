@@ -14,6 +14,7 @@ from horizon_harness.tools.edit import edit_file, edit_fingerprint
 
 from .journal import ExecutionJournal
 from .codec import encode_tool_result, decode_tool_result
+from .drift import store_before_image
 
 
 def atomic_edit_write(path: Path, content: str) -> None:
@@ -74,9 +75,12 @@ def make_durable_edit_tool(*, root: str | Path, journal: ExecutionJournal) -> Ag
         step_id = call_id if journal.step(call_id) is not None else f"{call_id}:edit"
         key = f"{step_id}:v1"
         try:
+            before_sha256 = store_before_image(
+                journal, resolved.read_bytes() if resolved.is_file() else b""
+            )
             intent = {
                 "path": str(resolved.relative_to(base)),
-                "before": edit_fingerprint(before),
+                "before": before_sha256,
                 "after": edit_fingerprint(expected_after),
                 "old_string": old_string,
                 "new_string": new_string,

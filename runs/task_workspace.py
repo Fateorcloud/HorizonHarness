@@ -21,6 +21,7 @@ from horizon_harness.memory import (
 )
 from horizon_harness.spec import AgentSpec
 from horizon_harness.workspace import TaskSession
+from horizon_harness.workspace.drift import drift_report, drifted_step_ids
 from horizon_harness.workspace.replay import (
     diff_runs,
     replay,
@@ -74,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     _run_args(resume)
     inspect = sub.add_parser("inspect")
     inspect.add_argument("task_id")
+    adopt = sub.add_parser("adopt-current")
+    adopt.add_argument("task_id")
+    adopt.add_argument("--step", required=True)
+    adopt.add_argument("--expected-sha", required=True)
+    adopt.add_argument("--note", default="")
     replay_cmd = sub.add_parser("replay")
     replay_cmd.add_argument("task_id")
     diff = sub.add_parser("diff")
@@ -107,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command in (
         "inspect",
+        "adopt-current",
         "replay",
         "diff",
         "fork",
@@ -137,6 +144,18 @@ def main(argv: list[str] | None = None) -> int:
             code_dir=args.code_dir,
             store_dir=args.store_dir,
         )
+        if args.command == "adopt-current":
+            try:
+                result = session.adopt_current(
+                    args.task_id,
+                    step_id=args.step,
+                    expected_sha=args.expected_sha,
+                    note=args.note,
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         if args.command == "diff":
             result = diff_runs(
                 session.store.journal(args.left_task_id),
@@ -177,11 +196,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        print(
-            json.dumps(
-                session.inspect(args.task_id).as_dict(), ensure_ascii=False, indent=2
-            )
-        )
+        inspected = session.inspect(args.task_id).as_dict()
+        journal = session.store.journal(args.task_id)
+        inspected["drift_reports"] = [
+            drift_report(journal, root=session.code_dir, step_id=step_id)
+            for step_id in drifted_step_ids(journal)
+        ]
+        print(json.dumps(inspected, ensure_ascii=False, indent=2))
         return 0
     if args.command in ("verify", "complete"):
         session = TaskSession(
